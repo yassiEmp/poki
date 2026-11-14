@@ -122,6 +122,11 @@ enum Request {
         #[serde(default = "drag_duration")]
         duration_ms: u64,
     },
+    Keys {
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
     Key {
         key: String,
         #[serde(default)]
@@ -185,6 +190,14 @@ impl Request {
                 if !(1..=60000).contains(duration_ms) =>
             {
                 return Err("duration_ms must be 1..60000".into());
+            }
+            Self::Keys { text, .. } => {
+                if text.chars().count() > 2000 {
+                    return Err("keys text exceeds 2000 characters".into());
+                }
+                for c in text.chars() {
+                    char_usage(c)?;
+                }
             }
             Self::Key {
                 key,
@@ -466,6 +479,26 @@ async fn execute_connected(
                 .send(hid)
                 .await?;
             }
+            Request::Keys { text, submit } => {
+                let mut keyboard = Keyboard::connect(adapter, rsd).await?;
+                let started = std::time::Instant::now();
+                let outcome: Result<()> = async {
+                    for c in text.chars() {
+                        let (usage, shift) = char_usage(c)?;
+                        let mods: Vec<u64> = if shift { vec![0xe1] } else { vec![] };
+                        chord(&mut keyboard, usage, &mods).await?;
+                    }
+                    if submit {
+                        chord(&mut keyboard, 0x28, &[]).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                let cleanup = keyboard.close().await;
+                outcome?;
+                cleanup?;
+                return Ok(json!({"sent":true,"chars":text.chars().count(),"submit_sent":submit,"typing_ms":started.elapsed().as_millis() as u64,"screen_change_verified":false}));
+            }
             Request::Key {
                 key,
                 modifiers,
@@ -652,4 +685,27 @@ async fn chord(keyboard: &mut Keyboard, key: u64, modifiers: &[u64]) -> Result<(
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
+}
+
+/// US-layout HID usage for one ASCII character: (usage, needs_shift).
+fn char_usage(c: char) -> Result<(u64, bool)> {
+    let r = match c {
+        'a'..='z' => (4 + (c as u64 - 'a' as u64), false),
+        'A'..='Z' => (4 + (c as u64 - 'A' as u64), true),
+        '1'..='9' => (0x1e + (c as u64 - '1' as u64), false),
+        '0' => (0x27, false),
+        ' ' => (0x2c, false),
+        '\n' => (0x28, false),
+        '!' => (0x1e, true), '@' => (0x1f, true), '#' => (0x20, true), '$' => (0x21, true),
+        '%' => (0x22, true), '^' => (0x23, true), '&' => (0x24, true), '*' => (0x25, true),
+        '(' => (0x26, true), ')' => (0x27, true),
+        '-' => (0x2d, false), '_' => (0x2d, true), '=' => (0x2e, false), '+' => (0x2e, true),
+        '[' => (0x2f, false), '{' => (0x2f, true), ']' => (0x30, false), '}' => (0x30, true),
+        '\\' => (0x31, false), '|' => (0x31, true), ';' => (0x33, false), ':' => (0x33, true),
+        '\'' => (0x34, false), '"' => (0x34, true), '`' => (0x35, false), '~' => (0x35, true),
+        ',' => (0x36, false), '<' => (0x36, true), '.' => (0x37, false), '>' => (0x37, true),
+        '/' => (0x38, false), '?' => (0x38, true),
+        _ => return Err(format!("keys supports ASCII only; use type_text for: {c:?}").into()),
+    };
+    Ok(r)
 }
